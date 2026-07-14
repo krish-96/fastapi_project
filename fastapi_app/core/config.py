@@ -6,6 +6,7 @@ Reads from environment variables (or .env file).
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 
 
 class Settings(BaseSettings):
@@ -48,6 +49,8 @@ class Settings(BaseSettings):
     APP_WORKERS: int = 1  # >1 disables reload
 
 
+    DB_URL: str = Field(default="mysql+pymysql://fastapi_admin:password@mysql/fastapi_app")  # required — no default, crashes loudly if missing
+    # DB_URL: str = Field()  # required — no default, crashes loudly if missing
 
 
 settings = Settings()

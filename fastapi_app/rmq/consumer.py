@@ -18,8 +18,8 @@ from typing import Callable, Awaitable
 import aio_pika
 from aio_pika import IncomingMessage
 
-from core.config import settings
-from rmq.health import set_shared_channel, rmq_health, RMQStatus
+from fastapi_app.core.config import settings
+from fastapi_app.rmq.health import set_shared_channel, rmq_health, RMQStatus
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +168,7 @@ async def _drain_tasks(timeout: float = 30.0) -> None:
 
 
 # ── Consumer loop ─────────────────────────────────────────────────────────────
-async def rmq_consumer() -> None:
+async def rmq_consumer(retry_delay_time=10) -> None:
     """
     Runs for the entire app lifetime (started as asyncio.create_task in lifespan).
 
@@ -179,7 +179,7 @@ async def rmq_consumer() -> None:
         4. connect_robust   → auto-reconnects on transient drops
         5. while True       → re-connects after hard broker failures
     """
-    logger.info("📨 RabbitMQ consumer starting")
+    logger.info(f"📨 RabbitMQ consumer starting, retry_delay_time was set to {retry_delay_time}")
 
     while True:
         connection = None
@@ -233,14 +233,15 @@ async def rmq_consumer() -> None:
             set_shared_channel(None)
             logger.error(
                 f"💥 Channel error — queue '{settings.RMQ_QUEUE}' likely deleted: {exc}  "
-                f"retrying in 5s"
+                f"retrying in{retry_delay_time}s"
             )
-            await asyncio.sleep(5)
+            await asyncio.sleep(retry_delay_time)
 
         except aio_pika.exceptions.AMQPConnectionError as exc:
-            logger.warning(f"🔴 RabbitMQ connection lost: {exc} — retrying in 5s")
+            logger.warning(f"🔴 RabbitMQ connection lost: {exc} — retrying in 5{retry_delay_time}")
             set_shared_channel(None)
-            await asyncio.sleep(5)
+            await asyncio.sleep(retry_delay_time)
+
 
         except asyncio.CancelledError:
             logger.info("📨 Consumer cancelled — draining in-flight tasks")
@@ -251,6 +252,6 @@ async def rmq_consumer() -> None:
             raise
 
         except Exception as exc:
-            logger.error(f"💥 Unexpected error: {exc} — retrying in 5s")
+            logger.error(f"💥 Unexpected error: {exc} — retrying in {retry_delay_time}s")
             set_shared_channel(None)
-            await asyncio.sleep(5)
+            await asyncio.sleep(retry_delay_time)

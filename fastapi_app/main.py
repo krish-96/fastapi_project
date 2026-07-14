@@ -25,10 +25,10 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from core.store import active_connections, broadcast_ws
-from rmq import rmq_consumer, rmq_health_checker
-from rmq.publisher import close as close_publisher
-from routers import async_demo_router, health_router, jobs_router, users_router
+from fastapi_app.core.store import active_connections, broadcast_ws
+from fastapi_app.rmq import rmq_consumer, rmq_health_checker
+from fastapi_app.rmq.publisher import close as close_publisher
+from fastapi_app.routers import async_demo_router, health_router, jobs_router, users_router
 
 # ─────────────────────────────────────────────
 # Logging
@@ -170,6 +170,7 @@ app.include_router(async_demo_router)
 # main.py
 if __name__ == "__main__":
     import uvicorn
+    print(f"settings.APP_DEBUG: {settings.APP_DEBUG}")
     uvicorn.run(
         "main:app",
         host=settings.APP_HOST,

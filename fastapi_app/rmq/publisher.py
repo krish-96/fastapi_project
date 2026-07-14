@@ -17,7 +17,7 @@ from datetime import datetime
 
 import aio_pika
 
-from core.config import settings
+from fastapi_app.core.config import settings
 
 logger = logging.getLogger(__name__)
 

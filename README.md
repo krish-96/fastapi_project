@@ -177,8 +177,6 @@ RabbitMQ is mocked in all tests — no broker needed.
 | `RMQ_HEALTH_INTERVAL_SECS` | `10`                                 | health probe interval (seconds)   |
 | `RMQ_PROBE_TIMEOUT_SECS`   | `3`                                  | TCP connect timeout for probe     |
 
-
-
 Sample App Starting Logs:
 
 ```bash
@@ -204,4 +202,102 @@ INFO:     Waiting for application shutdown.
 INFO:     Application shutdown complete.
 INFO:     Finished server process [291367]
 INFO:     Stopping reloader process [291365]
+```
+
+# Migrating the B changes
+
+Use Alembic — it compares your ORM models against the actual DB and generates migration scripts automatically.
+Setup:
+
+```bash
+uv add alembic
+uv run alembic init alembic   # creates alembic/ folder + alembic.ini
+```
+
+Tell Alembic about your models and DB — edit alembic/env.py:
+
+```python
+from core.config import settings
+from models.orm import Base  # imports all mapped classes
+
+config.set_main_option("sqlalchemy.url", settings.DB_URL)
+
+target_metadata = Base.metadata  # ← Alembic diffs against this
+```
+Workflow:
+```bash
+# 1. You change a model (add a column, new table, etc.)
+# 2. Auto-generate migration — Alembic diffs ORM vs DB
+
+uv run  alembic revision --autogenerate -m "add phone column to users"
+
+
+# 3. Review the generated file in alembic/versions/
+
+# 4. Apply it
+
+uv run alembic upgrade head
+
+# Rollback one step
+uv run alembic downgrade -1
+
+# See current state
+
+uv run alembic current
+
+```
+
+
+One gotcha with async — Alembic runs sync by default. Edit alembic/env.py to use async:
+
+```python
+from sqlalchemy.ext.asyncio import async_engine_from_config
+import asyncio
+
+def run_migrations_online():
+    connectable = async_engine_from_config(config.get_section(config.config_ini_section))
+
+    async def do_migrations():
+        async with connectable.connect() as connection:
+            await connection.run_sync(context.run_migrations)
+
+    asyncio.run(do_migrations())
+```
+
+Never auto-apply in production — always review generated scripts first. Alembic's --autogenerate misses things like
+index changes on existing columns and custom constraints — always sanity check before upgrade head.
+
+## Running the alembic commands
+
+After Fixing the issue with Sync and Async, the flow will be smooth
+
+```bash
+(fastapi_project) fastapi_project|master⚡ ⇒ uv run alembic revision --autogenerate -m "initial"
+INFO  [alembic.runtime.migration] Context impl MySQLImpl.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+INFO  [alembic.runtime.plugins] setting up autogenerate plugin alembic.autogenerate.schemas
+INFO  [alembic.runtime.plugins] setting up autogenerate plugin alembic.autogenerate.tables
+INFO  [alembic.runtime.plugins] setting up autogenerate plugin alembic.autogenerate.types
+INFO  [alembic.runtime.plugins] setting up autogenerate plugin alembic.autogenerate.constraints
+INFO  [alembic.runtime.plugins] setting up autogenerate plugin alembic.autogenerate.defaults
+INFO  [alembic.runtime.plugins] setting up autogenerate plugin alembic.autogenerate.comments
+INFO  [alembic.autogenerate.compare.tables] Detected added table 'users'
+INFO  [alembic.autogenerate.compare.constraints] Detected added index 'ix_users_email' on '('email',)'
+INFO  [alembic.autogenerate.compare.tables] Detected added table 'jobs'
+INFO  [alembic.autogenerate.compare.constraints] Detected added index 'ix_jobs_user_id' on '('user_id',)'
+  Generating /home/xxxxx/xxxxxxxx/fastapi_project/alembic/versions/89cc93b7e46d_initial.py ...  done
+```
+
+```bash
+(fastapi_project) fastapi_project|master⚡ ⇒ uuv run alembic upgrade head
+INFO  [alembic.runtime.migration] Context impl MySQLImpl.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+INFO  [alembic.runtime.migration] Running upgrade  -> 89cc93b7e46d, initial
+```
+```bash
+(fastapi_project) fastapi_project|master⚡ ⇒ uuv run alembic current
+
+INFO  [alembic.runtime.migration] Context impl MySQLImpl.
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+89cc93b7e46d (head)
 ```
