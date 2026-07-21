@@ -6,8 +6,8 @@ from core.config import settings
 # One engine per process — holds the connection pool
 engine = create_async_engine(
     settings.DB_URL,          # mysql+aiomysql://user:pass@host/db
-    pool_size=10,             # base connections kept alive
-    max_overflow=20,          # extra connections allowed under burst
+    pool_size=settings.DB_POOL_SIZE,             # base connections kept alive
+    max_overflow=settings.MAX_OVERFLOW_SIZE,          # extra connections allowed under burst
     pool_pre_ping=True,       # checks connection health before use (detects stale)
     echo=settings.APP_DEBUG,  # logs SQL — True in dev, False in prod
 )

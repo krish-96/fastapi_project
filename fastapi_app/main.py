@@ -26,18 +26,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from fastapi_app.core.store import active_connections, broadcast_ws
-from fastapi_app.rmq import rmq_consumer, rmq_health_checker
+from fastapi_app.rmq import rmq_consumer, rmq_health_checker, rmq_setup
 from fastapi_app.rmq.publisher import close as close_publisher
 from fastapi_app.routers import async_demo_router, health_router, jobs_router, users_router
+from fastapi_app.core.config import settings
 
 # ─────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────
+log_level = settings.LOG_LEVEL or logging.INFO  # To get eh value dynamically with fallback value as logger.INFO
+print(f"{log_level=}")
 logging.basicConfig(
-    level=logging.INFO,
+    # level=logging.INFO,
+    level=log_level,
     format="%(asctime)s [%(levelname)s] %(name)s: %(lineno)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
+# print(f"{'*'*25}: {logger.name}")
+logging.getLogger("aio_pika.tools").setLevel(logging.CRITICAL)
+logging.getLogger("aio_pika").setLevel(logging.WARNING)
+logging.getLogger("aiormq").setLevel(logging.WARNING)
+# logging.getLogger("watchfiles").setLevel(logging.WARNING)
 
 
 # ─────────────────────────────────────────────
@@ -58,6 +67,9 @@ async def lifespan(app: FastAPI):
 
     # Shared async HTTP client — one connection pool for the whole process
     app.state.http_client = httpx.AsyncClient(timeout=10.0)
+
+    # To setup the RabbitMQ Exchange, Queue and Binding them
+    await rmq_setup()
 
     # RabbitMQ consumer — reconnects on broker restart
     # consumer_task = asyncio.create_task(rmq_consumer(), name="mq-consumer")

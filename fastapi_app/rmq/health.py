@@ -11,7 +11,7 @@ can be wrong independently:
 
 Both are tracked separately in RMQHealthState.
 """
-
+import time
 import asyncio
 import datetime as dt
 import logging
@@ -21,6 +21,8 @@ import aio_pika
 from aio_pika.exceptions import AMQPChannelError
 
 from fastapi_app.core.config import settings
+from .setup import rmq_setup
+
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +89,9 @@ async def on_rabbitmq_recovered(state: RMQHealthState) -> None:
     logger.info(f"🟢 RabbitMQ RECOVERED at {state.last_alive.isoformat()}")
 
 async def on_rabbitmq_still_alive(state: RMQHealthState) -> None:
+    # logger.info(f"✅ RabbitMQ alive via {state.probe_method}")
     logger.debug(f"✅ RabbitMQ alive via {state.probe_method}")
+    # pass
 
 async def on_rabbitmq_still_dead(state: RMQHealthState) -> None:
     logger.warning(f"🔴 RabbitMQ still DOWN  failures={state.consecutive_failures}")
@@ -140,10 +144,17 @@ async def _probe_passive(channel: aio_pika.RobustChannel, timeout: float) -> Pro
         # Queue lifecycle is owned by infra (your ops team / Terraform).
         # If your app owns the queue, use passive=False only on initial startup,
         # never on reconnect — wrong settings (DLX, durability) cause silent data loss.
-        queue = await channel.declare_queue(
-            settings.RMQ_QUEUE,
-            passive=True,
-            timeout=timeout
+        # queue = await channel.declare_queue(
+        #     settings.RMQ_QUEUE,
+        #     passive=True,
+        #     timeout=timeout
+        # )
+        await asyncio.wait_for(
+            channel.declare_queue(
+                settings.RMQ_QUEUE,
+                passive=True,
+            ),
+            timeout=timeout,
         )
         # await channel.declare_queue(settings.RMQ_QUEUE, passive=True, timeout=timeout)
         return ProbeResult(broker_alive=True, queue_exists=True, method="passive")
@@ -212,57 +223,107 @@ async def rmq_health_checker() -> None:
     """
     interval      = settings.RMQ_HEALTH_INTERVAL_SECS
     probe_timeout = settings.RMQ_PROBE_TIMEOUT_SECS
-    # Wait for consumer to finish declaring queue before first probe
-    await asyncio.sleep(settings.RMQ_HEALTH_INITIAL_DELAY_SECS)
 
-    logger.info(f"🩺 Health checker started — interval={interval}s  timeout={probe_timeout}s")
+    if settings.RMQ_INITIAL_HEALTH_CHECK_TYPE == 'sleep':
+        logger.info(f"🩺 [Sleep] Health checker started — delaying health check by {settings.RMQ_HEALTH_INITIAL_DELAY_SECS} s")
+        # Option-1: Wait for the initial delay
+        # Wait for consumer to finish declaring queue before first probe
+        await asyncio.sleep(settings.RMQ_HEALTH_INITIAL_DELAY_SECS)
+    else:
+        logger.info(f"🩺 [Poll] Health checker started— interval={interval}s  timeout={probe_timeout}s")
 
+        # Option-2: poll until shared channel is available instead of blind sleep:
+        # wait for consumer to register channel, max 10s
+        for _ in range(20):
+            start_time = time.perf_counter()
+            if _shared_channel is not None:
+                logger.info(
+                    f"_shared_channel is set, Time taken : {time.perf_counter() - start_time}. Moving to running the probe"
+                )
+                break
+            await asyncio.sleep(0.5)
+
+    # ── Run first probe immediately on startup ────────────────────────────
+    await _run_probe(probe_timeout)   # ← no wait, instant first result
+
+    # ── Then tick on interval ─────────────────────────────────────────────
     while True:
-        try:
-            result      = await _probe(probe_timeout)
-            now         = dt.datetime.now(dt.UTC)
-            prev_status = rmq_health.status
-
-            rmq_health.last_checked = now
-            rmq_health.probe_method = result.method
-            rmq_health.queue_exists = result.queue_exists
-
-            if result.broker_alive and result.queue_exists:
-                # ── Fully healthy ─────────────────────────────────────
-                rmq_health.last_alive           = now
-                rmq_health.consecutive_failures = 0
-
-                if prev_status in (RMQStatus.DEAD, RMQStatus.UNKNOWN, RMQStatus.DEGRADED):
-                    rmq_health.status = RMQStatus.RECOVERED
-                    await on_rabbitmq_recovered(rmq_health)
-                else:
-                    rmq_health.status = RMQStatus.ALIVE
-                    await on_rabbitmq_still_alive(rmq_health)
-
-            elif result.broker_alive and not result.queue_exists:
-                # ── Broker up, queue missing ──────────────────────────
-                rmq_health.consecutive_failures += 1
-                if prev_status != RMQStatus.DEGRADED:
-                    rmq_health.status    = RMQStatus.DEGRADED
-                    rmq_health.last_dead = now
-                    await on_queue_missing(rmq_health)
-                else:
-                    logger.warning(
-                        f"⚠️  Queue still missing — failures={rmq_health.consecutive_failures}"
-                    )
-
-            else:
-                # ── Broker down ───────────────────────────────────────
-                rmq_health.consecutive_failures += 1
-                if prev_status != RMQStatus.DEAD:
-                    rmq_health.status    = RMQStatus.DEAD
-                    rmq_health.last_dead = now
-                    await on_rabbitmq_down(rmq_health)
-                else:
-                    await on_rabbitmq_still_dead(rmq_health)
-
-        except asyncio.CancelledError:
-            logger.info("🩺 Health checker stopped")
-            raise
-
         await asyncio.sleep(interval)
+        await _run_probe(probe_timeout)
+
+async def _run_probe(probe_timeout: float) -> None:
+
+    """
+    Single probe tick — updates rmq_health state and fires hooks.
+
+    State machine:
+        UNKNOWN   → broker up + queue exists   → ALIVE
+        UNKNOWN   → broker up + queue missing  → DEGRADED  fires on_queue_missing()
+        UNKNOWN   → broker down                → DEAD      fires on_rabbitmq_down()
+        ALIVE     → queue deleted              → DEGRADED  fires on_queue_missing()
+        ALIVE     → broker down                → DEAD      fires on_rabbitmq_down()
+        DEAD      → broker up + queue exists   → RECOVERED fires on_rabbitmq_recovered()
+        DEAD      → broker up + queue missing  → DEGRADED  fires on_queue_missing()
+        DEGRADED  → queue recreated            → RECOVERED fires on_rabbitmq_recovered()
+    """
+
+    logger.debug(f"🩺 Health checker run_probe started — timeout={probe_timeout}s")
+
+    try:
+        result      = await _probe(probe_timeout)
+        now         = dt.datetime.now(dt.UTC)
+        prev_status = rmq_health.status
+
+        rmq_health.last_checked = now
+        rmq_health.probe_method = result.method
+        rmq_health.queue_exists = result.queue_exists
+
+        if result.broker_alive and result.queue_exists:
+            # ── Fully healthy ─────────────────────────────────────
+            rmq_health.last_alive           = now
+            rmq_health.consecutive_failures = 0
+
+            if prev_status in (RMQStatus.DEAD, RMQStatus.UNKNOWN, RMQStatus.DEGRADED):
+                rmq_health.status = RMQStatus.RECOVERED
+                await on_rabbitmq_recovered(rmq_health)
+            else:
+                rmq_health.status = RMQStatus.ALIVE
+                await on_rabbitmq_still_alive(rmq_health)
+
+        elif result.broker_alive and not result.queue_exists:
+            # ── Broker up, queue missing ──────────────────────────
+            rmq_health.consecutive_failures += 1
+            if prev_status != RMQStatus.DEGRADED:
+                rmq_health.status    = RMQStatus.DEGRADED
+                rmq_health.last_dead = now
+                await on_queue_missing(rmq_health)
+                if settings.CREATE_QUEUE_IF_DELETED:
+                    logger.info(
+                        f"Queue still missing — failures={rmq_health.consecutive_failures} "
+                        "Setting up the RMQ Exchange, Queue again."
+                    )
+                    await rmq_setup()
+                else:
+                    logger.info(
+                        f"Queue still missing — failures={rmq_health.consecutive_failures} "
+                        "Skipping the Setting up the RMQ Exchange, Queue (Due to false in config)."
+                    )
+            else:
+                logger.warning(
+                    f"⚠️  Queue still missing — failures={rmq_health.consecutive_failures}"
+                )
+
+        else:
+            # ── Broker down ───────────────────────────────────────
+            rmq_health.consecutive_failures += 1
+            if prev_status != RMQStatus.DEAD:
+                rmq_health.status    = RMQStatus.DEAD
+                rmq_health.last_dead = now
+                await on_rabbitmq_down(rmq_health)
+            else:
+                await on_rabbitmq_still_dead(rmq_health)
+
+    except asyncio.CancelledError:
+        logger.info("🩺 Health checker stopped")
+        raise
+
